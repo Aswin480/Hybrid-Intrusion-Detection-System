@@ -7,8 +7,7 @@ import random
 import requests
 from collections import defaultdict
 from datetime import datetime
-
-import plotly.graph_objects as go
+import database as db  # --- Import the database module ---
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -16,6 +15,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="auto"
 )
+
+# --- Initialize the database on startup ---
+db.init_db()
 
 # --- Styling ---
 st.markdown("""
@@ -42,11 +44,10 @@ h2, h3, h5, h6 { color: #2D3748; }
 BACKEND_URL = "http://127.0.0.1:5000"
 
 # --- Session State Initialization ---
+# Remove log and count tracking, as the DB will handle this.
+# Keep state_manager for the live session's DFA states.
 defaults = {
     'state_manager': {},
-    'analysis_log': [],
-    'threat_counts': defaultdict(int),
-    'status_counts': defaultdict(int),
     'packet_input': "",
     'last_analysis': None,
     'is_simulating': False,
@@ -111,12 +112,11 @@ def analyze_and_update(packet_data_str):
             result = result_json['final_result']
             new_state = result_json['new_state']
             st.session_state.state_manager[src] = new_state
-            st.session_state.status_counts[result['status']] += 1
-            if result['status'] == 'Not Safe':
-                st.session_state.threat_counts[result['reason']] += 1
 
             sev, rec = get_threat_intelligence(result['reason'])
-            st.session_state.analysis_log.insert(0, {
+
+            # --- Create a log entry dictionary ---
+            log_entry = {
                 'Timestamp': datetime.now(),
                 'Source IP': parsed.get('Source IP', 'N/A'),
                 'Destination Port': parsed.get('Destination Port', 'N/A'),
@@ -125,7 +125,9 @@ def analyze_and_update(packet_data_str):
                 'Severity': sev,
                 'Recommendation': rec,
                 'Details': result['details']
-            })
+            }
+            # --- Add the new entry to the database ---
+            db.add_log_entry(log_entry)
         else:
             st.error(f"Backend error: {resp.status_code} - {resp.text}")
     except Exception as e:
@@ -226,16 +228,19 @@ with tab1:
     with result_col:
         with st.container(border=True, height=750):
             st.subheader("Analysis Result")
-            if st.session_state.last_analysis and st.session_state.analysis_log:
+            # --- Fetch the latest log for display ---
+            all_logs_df = db.get_logs_as_df()
+            if st.session_state.last_analysis and not all_logs_df.empty:
                 result = st.session_state.last_analysis['final_result']
-                log_entry = st.session_state.analysis_log[0]
+                # Get the most recent log entry from the DataFrame
+                log_entry = all_logs_df.iloc[0]
                 if result['status'] == 'Safe':
                     st.success(f"**Status: {result['status']}**")
                 else:
-                    st.error(f"**Status: {result['status']}** | Severity: **{log_entry['Severity']}**")
+                    st.error(f"**Status: {result['status']}** | Severity: **{log_entry['severity']}**")
                 st.info(f"**Finding:** {result['details']}")
                 if result['status'] != 'Safe':
-                    st.warning(f"**Recommendation:** {log_entry['Recommendation']}")
+                    st.warning(f"**Recommendation:** {log_entry['recommendation']}")
                 with st.expander("Packet Inspector"):
                     st.dataframe(pd.DataFrame(json.loads(st.session_state.packet_input).items(),
                                               columns=['Feature', 'Value']),
@@ -250,38 +255,46 @@ with tab1:
 # ==========================================================
 with tab2:
     st.subheader("Reporting & Analytics")
-    if not st.session_state.analysis_log:
-        st.info("No data yet.")
+    # --- Fetch data directly from the database ---
+    df = db.get_logs_as_df()
+    if df.empty:
+        st.info("No data yet. Analyze some packets to see analytics.")
     else:
-        df = pd.DataFrame(st.session_state.analysis_log)
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
         total_packets = len(df)
-        total_threats = len(df[df['Status'] == 'Not Safe'])
+        total_threats = len(df[df['status'] == 'Not Safe'])
         rate = (total_threats / total_packets * 100) if total_packets else 0
         k1, k2, k3 = st.columns(3)
-        k1.metric("Total Packets", total_packets)
-        k2.metric("Threats", total_threats)
-        k3.metric("Detection Rate", f"{rate:.2f}%")
+        k1.metric("Total Packets Logged", total_packets)
+        k2.metric("Total Threats Found", total_threats)
+        k3.metric("Overall Detection Rate", f"{rate:.2f}%")
 
 # ==========================================================
 # TAB 3: Threat Log
 # ==========================================================
 with tab3:
     st.subheader("Threat Log")
-    if not st.session_state.analysis_log:
-        st.info("No threats logged.")
+    # --- Fetch data directly from the database ---
+    df = db.get_logs_as_df()
+    if df.empty:
+        st.info("No threats have been logged.")
     else:
-        df = pd.DataFrame(st.session_state.analysis_log)
         filter_txt = st.text_input("Search Log", placeholder="e.g., IP, Reason, Severity")
         if filter_txt:
-            df = df[df.apply(lambda r: filter_txt.lower() in str(r).lower(), axis=1)]
-        df['Timestamp'] = df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-        st.dataframe(df, use_container_width=True, hide_index=True)
+            # Search across all columns by converting row to a single string
+            df = df[df.apply(lambda r: filter_txt.lower() in ' '.join(r.astype(str)).lower(), axis=1)]
+
+        # Display the timestamp correctly
+        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        st.dataframe(df, use_container_width=True, hide_index=True,
+                     column_order=["timestamp", "status", "severity", "reason", "source_ip", "destination_port", "details"])
+
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download CSV", csv, "threat_log.csv", "text/csv")
-        if st.button("Clear Logs"):
-            st.session_state.analysis_log = []
-            st.session_state.threat_counts = defaultdict(int)
-            st.session_state.status_counts = defaultdict(int)
-            st.session_state.last_analysis = None
+        st.download_button("Download Log (CSV)", csv, "threat_log.csv", "text/csv")
+
+        # --- Clear button calls the database function ---
+        if st.button("Clear All Log Data", type="primary"):
+            db.clear_logs()
+            st.session_state.last_analysis = None # Clear last result from UI
+            st.success("All logs have been cleared from the database.")
+            time.sleep(1) # Give user time to see the message
             st.rerun()
