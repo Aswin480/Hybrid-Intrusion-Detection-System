@@ -1,0 +1,287 @@
+# frontend.py
+import streamlit as st
+import json
+import pandas as pd
+import time
+import random
+import requests
+from collections import defaultdict
+from datetime import datetime
+
+import plotly.graph_objects as go
+
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Hybrid Intrusion Detection System",
+    layout="wide",
+    initial_sidebar_state="auto"
+)
+
+# --- Styling ---
+st.markdown("""
+<style>
+.stApp { background-color: #F0F2F6; }
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background-color: #FFFFFF;
+    border-radius: 10px;
+    border: 1px solid #E2E8F0;
+    padding: 1rem;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1),
+                0 2px 4px -1px rgba(0, 0, 0, 0.06);
+}
+h1 { color: #1A202C; font-weight: 700; }
+h2, h3, h5, h6 { color: #2D3748; }
+.stButton>button[kind="primary"] {
+    background-color: #3182CE; color: white; font-weight: 600; border: none;
+}
+.stButton>button[kind="primary"]:hover { background-color: #2B6CB0; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- Backend URL ---
+BACKEND_URL = "http://127.0.0.1:5000"
+
+# --- Session State Initialization ---
+defaults = {
+    'state_manager': {},
+    'analysis_log': [],
+    'threat_counts': defaultdict(int),
+    'status_counts': defaultdict(int),
+    'packet_input': "",
+    'last_analysis': None,
+    'is_simulating': False,
+    'ml_threshold': 70,
+    'sim_speed': 3,
+    'backend_status': ("Unknown", "Checking connection...")
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# --- Helper Functions ---
+@st.cache_data(ttl=15)
+def check_backend_status():
+    try:
+        r = requests.get(f"{BACKEND_URL}/status", timeout=2)
+        return ("Connected", "Backend is online.") if r.status_code == 200 else ("Error", f"Status {r.status_code}")
+    except requests.exceptions.ConnectionError:
+        return ("Disconnected", "Cannot reach backend.")
+    except Exception as e:
+        return ("Error", str(e))
+
+def display_pipeline_visualization(pipeline_steps):
+    st.subheader("Analysis Pipeline")
+    for step in pipeline_steps:
+        with st.expander(f"{step['stage']} - {step['status']}", expanded=step['status'] == 'Failed'):
+            if step['status'] == 'Passed':
+                st.success(step['details'])
+            else:
+                st.error(step['details'])
+
+def get_threat_intelligence(reason):
+    mapping = {
+        "Stateful DFA Match": ("High", "Potential brute-force attack. Block source IP."),
+        "Stateless DFA Rule Match": ("Medium", "Packet matches known malicious signature."),
+        "ML Model Detection": ("Low", "Anomalous traffic detected by ML model."),
+        "ANN Model Detection": ("Critical", "High-confidence attack detection. Investigate immediately.")
+    }
+    return mapping.get(reason, ("Info", "No action required."))
+
+# ==========================================================
+# SAFE FUNCTION (no widget conflicts)
+# ==========================================================
+def analyze_and_update(packet_data_str):
+    try:
+        parsed = json.loads(packet_data_str)
+        src = parsed.get("Source IP", "192.168.1.100")
+        current_state = st.session_state.state_manager.get(src, 'START')
+
+        payload = {
+            'packet_data': parsed,
+            'current_state': current_state,
+            'ml_threshold': st.session_state.ml_threshold / 100
+        }
+        resp = requests.post(f"{BACKEND_URL}/analyze", json=payload)
+
+        if resp.status_code == 200:
+            result_json = resp.json()
+            st.session_state.last_analysis = result_json
+            st.session_state.packet_input = packet_data_str
+
+            result = result_json['final_result']
+            new_state = result_json['new_state']
+            st.session_state.state_manager[src] = new_state
+            st.session_state.status_counts[result['status']] += 1
+            if result['status'] == 'Not Safe':
+                st.session_state.threat_counts[result['reason']] += 1
+
+            sev, rec = get_threat_intelligence(result['reason'])
+            st.session_state.analysis_log.insert(0, {
+                'Timestamp': datetime.now(),
+                'Source IP': parsed.get('Source IP', 'N/A'),
+                'Destination Port': parsed.get('Destination Port', 'N/A'),
+                'Status': result['status'],
+                'Reason': result['reason'],
+                'Severity': sev,
+                'Recommendation': rec,
+                'Details': result['details']
+            })
+        else:
+            st.error(f"Backend error: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        st.error(f"An error occurred during analysis: {e}")
+        # Safe stop simulation
+        if 'is_simulating' in st.session_state:
+            st.session_state.is_simulating = False
+
+# ==========================================================
+# SIDEBAR
+# ==========================================================
+with st.sidebar:
+    st.title("Configuration")
+
+    with st.container(border=True):
+        st.subheader("System Status")
+        s, msg = check_backend_status()
+        st.success(f"Backend: {s}" if s == "Connected" else f"Backend: {s}")
+
+    with st.container(border=True):
+        st.subheader("Analysis Settings")
+        st.slider("ML Sensitivity Threshold (%)", 50, 95,
+                  key="ml_threshold", help="Set confidence threshold for XGBoost.")
+
+    with st.container(border=True):
+        st.subheader("Simulation Settings")
+        st.slider("Simulation Speed (seconds/packet)", 1, 10,
+                  key="sim_speed", help="Delay between packets in Live Simulation.")
+
+# ==========================================================
+# MAIN PAGE
+# ==========================================================
+st.title("Hybrid Intrusion Detection System")
+st.markdown("Detect network threats using a hybrid analytical pipeline (DFA + ML + ANN).")
+
+tab1, tab2, tab3 = st.tabs(["🔬 Live Analysis", "📈 Reporting & Analytics", "📋 Threat Log"])
+
+# ==========================================================
+# TAB 1: Live Analysis
+# ==========================================================
+with tab1:
+    sample_packets = {
+        "dfa": json.dumps({"Destination Port": 80, "Flow Duration": 298564410, "FIN Flag Count": 0, "SYN Flag Count": 1, "PSH Flag Count": 1}, indent=4),
+        "failed_login": json.dumps({"Source IP": "10.0.0.5", "Destination Port": 22, "num_failed_logins": 1, "logged_in": 0}, indent=4),
+        "ml_attack": json.dumps({'Destination Port': 8080, 'Flow Duration': 10, 'Flow Bytes/s': 2048000.0, 'Flow Packets/s': 200000.0}, indent=4),
+        "benign": json.dumps({'Destination Port': 443, 'Flow Duration': 1200000, 'logged_in': 1, 'FIN Flag Count': 1, "SYN Flag Count": 0}, indent=4),
+    }
+
+    all_samples = list(sample_packets.values())
+
+    # --- Safe Widget Mirror ---
+    st.session_state.is_simulating = st.session_state.get("is_simulating_ui", False)
+    st.session_state.packet_input = st.session_state.get("packet_input_ui", "")
+
+    if st.session_state.is_simulating:
+        random_packet = random.choice(all_samples)
+        analyze_and_update(random_packet)
+        time.sleep(st.session_state.sim_speed)
+        st.rerun()
+
+    input_col, result_col = st.columns([0.55, 0.45], gap="large")
+
+    with input_col:
+        with st.container(border=True):
+            st.subheader("Packet Data Input")
+            st.toggle("Live Simulation", key="is_simulating_ui", help="Automatically analyze random sample packets.")
+            packet_data_input = st.text_area(
+                "Paste Packet Data (JSON format):",
+                height=250,
+                key="packet_input_ui",
+                label_visibility="collapsed",
+                disabled=st.session_state.is_simulating
+            )
+
+            st.markdown("<h6>Load a sample packet:</h6>", unsafe_allow_html=True)
+            bcols = st.columns(4)
+            bcols[0].button("Stateless (DFA)", on_click=lambda: st.session_state.update(packet_input_ui=sample_packets["dfa"]), disabled=st.session_state.is_simulating)
+            bcols[1].button("Stateful (Login)", on_click=lambda: st.session_state.update(packet_input_ui=sample_packets["failed_login"]), disabled=st.session_state.is_simulating)
+            bcols[2].button("ML Attack", on_click=lambda: st.session_state.update(packet_input_ui=sample_packets["ml_attack"]), disabled=st.session_state.is_simulating)
+            bcols[3].button("Benign", on_click=lambda: st.session_state.update(packet_input_ui=sample_packets["benign"]), disabled=st.session_state.is_simulating)
+
+            if st.button("Analyze Packet", type="primary", use_container_width=True, disabled=st.session_state.is_simulating):
+                if not packet_data_input:
+                    st.warning("Input is empty.")
+                else:
+                    analyze_and_update(packet_data_input)
+
+        with st.container(border=True):
+            st.subheader("Stateful Tracker (Session)")
+            if not st.session_state.state_manager:
+                st.caption("No states currently tracked.")
+            else:
+                st.json(st.session_state.state_manager)
+            if st.button("Clear Tracked States", disabled=st.session_state.is_simulating):
+                st.session_state.state_manager = {}
+                st.rerun()
+
+    with result_col:
+        with st.container(border=True, height=750):
+            st.subheader("Analysis Result")
+            if st.session_state.last_analysis and st.session_state.analysis_log:
+                result = st.session_state.last_analysis['final_result']
+                log_entry = st.session_state.analysis_log[0]
+                if result['status'] == 'Safe':
+                    st.success(f"**Status: {result['status']}**")
+                else:
+                    st.error(f"**Status: {result['status']}** | Severity: **{log_entry['Severity']}**")
+                st.info(f"**Finding:** {result['details']}")
+                if result['status'] != 'Safe':
+                    st.warning(f"**Recommendation:** {log_entry['Recommendation']}")
+                with st.expander("Packet Inspector"):
+                    st.dataframe(pd.DataFrame(json.loads(st.session_state.packet_input).items(),
+                                              columns=['Feature', 'Value']),
+                                 use_container_width=True, hide_index=True)
+                st.markdown("---")
+                display_pipeline_visualization(st.session_state.last_analysis['pipeline_steps'])
+            else:
+                st.info("Results will appear here after analysis.")
+
+# ==========================================================
+# TAB 2: Reporting & Analytics
+# ==========================================================
+with tab2:
+    st.subheader("Reporting & Analytics")
+    if not st.session_state.analysis_log:
+        st.info("No data yet.")
+    else:
+        df = pd.DataFrame(st.session_state.analysis_log)
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        total_packets = len(df)
+        total_threats = len(df[df['Status'] == 'Not Safe'])
+        rate = (total_threats / total_packets * 100) if total_packets else 0
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Packets", total_packets)
+        k2.metric("Threats", total_threats)
+        k3.metric("Detection Rate", f"{rate:.2f}%")
+
+# ==========================================================
+# TAB 3: Threat Log
+# ==========================================================
+with tab3:
+    st.subheader("Threat Log")
+    if not st.session_state.analysis_log:
+        st.info("No threats logged.")
+    else:
+        df = pd.DataFrame(st.session_state.analysis_log)
+        filter_txt = st.text_input("Search Log", placeholder="e.g., IP, Reason, Severity")
+        if filter_txt:
+            df = df[df.apply(lambda r: filter_txt.lower() in str(r).lower(), axis=1)]
+        df['Timestamp'] = df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download CSV", csv, "threat_log.csv", "text/csv")
+        if st.button("Clear Logs"):
+            st.session_state.analysis_log = []
+            st.session_state.threat_counts = defaultdict(int)
+            st.session_state.status_counts = defaultdict(int)
+            st.session_state.last_analysis = None
+            st.rerun()

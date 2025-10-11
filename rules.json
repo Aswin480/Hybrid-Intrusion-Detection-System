@@ -1,0 +1,62 @@
+[
+  {
+    "rule_name": "Potential Port Scan (SYN Flood)",
+    "conditions": [
+      {
+        "feature": "Total Fwd Packets",
+        "operator": ">",
+        "value": 50
+      },
+      {
+        "feature": "Flow Duration",
+        "operator": "<",
+        "value": 1000000
+      },
+      {
+        "feature": "SYN Flag Count",
+        "operator": ">",
+        "value": 0
+      },
+       {
+        "feature": "FIN Flag Count",
+        "operator": "==",
+        "value": 0
+      }
+    ]
+  },
+  {
+    "rule_name": "FTP Brute-Force Attempt",
+    "conditions": [
+      {
+        "feature": "Destination Port",
+        "operator": "==",
+        "value": 21
+      },
+      {
+        "feature": "Total Fwd Packets",
+        "operator": ">",
+        "value": 10
+      },
+      {
+        "feature": "Flow IAT Min",
+        "operator": "<",
+        "value": 500
+      }
+    ]
+  },
+  {
+    "rule_name": "Tiny Fragment Attack Pattern",
+    "conditions": [
+        {
+            "feature": "Min Packet Length",
+            "operator": "<",
+            "value": 20
+        },
+        {
+            "feature": "Total Length of Fwd Packets",
+            "operator": "<",
+            "value": 40
+        }
+    ]
+  }
+]
