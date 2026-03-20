@@ -240,5 +240,5 @@ This project is licensed under the [MIT License](https://opensource.org/licenses
 ---
 
 ## 🧑‍💻 Author
-**Your Name**  
+NAVEEN JAYARAJ,ASWIN S,MADHAV K MOHAN
 Hybrid IDS Project — Combining DFA + ML + ANN for Smarter Threat Detection
